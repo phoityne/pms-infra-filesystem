@@ -84,7 +84,7 @@ run = do
 
         let domDat = ctx^.domainDataSpecContext
             appDat = ctx^.appDataSpecContext
-            cmdQ   = domDat^.DM.cmdRunQueueDomainData
+            cmdQ   = domDat^.DM.fileSystemQueueDomainData
             resQ   = domDat^.DM.responseQueueDomainData
             expect = "abc"
             jsonR  = def {DM._jsonrpcJsonRpcRequest = expect}

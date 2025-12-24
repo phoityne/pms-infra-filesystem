@@ -6,6 +6,7 @@
 module PMS.Infra.FileSystem.DS.Core where
 
 import System.IO
+import Control.Monad
 import Control.Monad.Logger
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
@@ -13,21 +14,22 @@ import Control.Lens
 import Control.Monad.Reader
 import qualified Control.Concurrent.STM as STM
 import Data.Conduit
-import qualified Control.Concurrent as CC
 import Control.Concurrent.Async
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
+import           Data.List (isPrefixOf)
 import Control.Monad.Except
+import System.Directory
 import System.FilePath
 import Data.Aeson
 import qualified Control.Exception.Safe as E
 import System.Exit
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy.Char8 as BL
 
 import qualified PMS.Domain.Model.DM.Type as DM
 import qualified PMS.Domain.Model.DM.Constant as DM
-import qualified PMS.Domain.Model.DS.Utility as DM
 
 import PMS.Infra.FileSystem.DM.Type
 import PMS.Infra.FileSystem.DS.Utility
@@ -51,7 +53,7 @@ src = lift go >>= yield >> src
   where
     go :: AppContext DM.FileSystemCommand
     go = do
-      queue <- view DM.cmdRunQueueDomainData <$> lift ask
+      queue <- view DM.fileSystemQueueDomainData <$> lift ask
       liftIO $ STM.atomically $ STM.readTQueue queue
 
 ---------------------------------------------------------------------------------
@@ -75,7 +77,9 @@ cmd2task = await >>= \case
 
     go :: DM.FileSystemCommand -> AppContext (IOTask ())
     go (DM.EchoFileSystemCommand dat) = genEchoTask dat
-    go (DM.DefaultFileSystemCommand dat) = genFileSystemTask dat
+    go (DM.DirListFileSystemCommand dat) = genDirListTask dat
+    go (DM.ReadFileFileSystemCommand dat) = genReadFileTask dat
+    go (DM.WriteFileFileSystemCommand dat) = genWriteFileTask dat
 
 ---------------------------------------------------------------------------------
 -- |
@@ -101,6 +105,9 @@ sink = await >>= \case
       $logDebugS DM._LOGTAG "sink: end async."
       return ()
 
+
+
+
 ---------------------------------------------------------------------------------
 -- |
 --
@@ -114,14 +121,52 @@ genEchoTask dat = do
 
 
 -- |
---   
+--
 echoTask :: STM.TQueue DM.McpResponse -> DM.EchoFileSystemCommandData -> String -> IOTask ()
 echoTask resQ cmdDat val = flip E.catchAny errHdl $ do
-  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.echoTask run. " ++ val
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.echoTask run. " ++ val
 
-  response ExitSuccess val ""
+  toolsCallResponse resQ (cmdDat^.DM.jsonrpcEchoFileSystemCommandData) ExitSuccess val ""
 
-  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.echoTask end."
+  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.echoTask end."
+
+  where
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = toolsCallResponse resQ (cmdDat^.DM.jsonrpcEchoFileSystemCommandData) (ExitFailure 1) "" (show e)
+
+
+---------------------------------------------------------------------------------
+-- |
+--
+genDirListTask :: DM.DirListFileSystemCommandData -> AppContext (IOTask ())
+genDirListTask dat = do
+  let argsBS   = DM.unRawJsonByteString $ dat^.DM.argumentsDirListFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode $ argsBS
+
+  let path = argsDat^.pathDirListParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ <- view DM.responseQueueDomainData <$> lift ask
+
+  $logDebugS DM._LOGTAG $ T.pack $ "dirListTask: " ++ abPath
+  return $ dirListTask resQ dat abPath
+
+-- |
+--   
+dirListTask :: STM.TQueue DM.McpResponse -> DM.DirListFileSystemCommandData -> String -> IOTask ()
+dirListTask resQ cmdDat path = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.dirListTask run. " ++ path
+
+  names <- listDirectory path
+
+  entries <- mapM (mkEntry path) names
+
+  let entriesJson :: String
+      entriesJson = BL.unpack (encode entries)
+
+  response ExitSuccess entriesJson ""
+
+  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.dirListTask end."
 
   where
     errHdl :: E.SomeException -> IO ()
@@ -129,7 +174,8 @@ echoTask resQ cmdDat val = flip E.catchAny errHdl $ do
 
     response :: ExitCode -> String -> String -> IO ()
     response code outStr errStr = do
-      let jsonRpc = cmdDat^.DM.jsonrpcEchoFileSystemCommandData
+      let jsonRpc = cmdDat^.DM.jsonrpcDirListFileSystemCommandData
+      
           content = [ DM.McpToolsCallResponseResultContent "text" outStr
                     , DM.McpToolsCallResponseResultContent "text" errStr
                     ]
@@ -142,71 +188,62 @@ echoTask resQ cmdDat val = flip E.catchAny errHdl $ do
 
       STM.atomically $ STM.writeTQueue resQ res
 
+    mkEntry :: FilePath -> FilePath -> IO DirEntry
+    mkEntry base name = do
+      let fullPath = base </> name
+
+      isDir  <- doesDirectoryExist fullPath
+
+      mSize <- if isDir then pure Nothing
+          else do
+            sz <- withFile fullPath ReadMode hFileSize
+            pure (Just (fromIntegral sz))
+
+      pure DirEntry {
+             _nameDirEntry  = name
+           , _paathDirEntry = fullPath
+           , _typeDirEntry  = if isDir then "directory" else "file"
+           , _sizeDirEntry  = mSize
+           }
+
+---------------------------------------------------------------------------------
 -- |
 --
-genFileSystemTask :: DM.DefaultFileSystemCommandData -> AppContext (IOTask ())
-genFileSystemTask dat = do
-  toolsDir <- view DM.toolsDirDomainData <$> lift ask
+genReadFileTask :: DM.ReadFileFileSystemCommandData -> AppContext (IOTask ())
+genReadFileTask dat = do
+  let argsBS   = DM.unRawJsonByteString $ dat^.DM.argumentsReadFileFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode $ argsBS
+
+  let path = argsDat^.pathReadFileParams
+  abPath <- liftIO $ makeAbsolute path
+
   resQ <- view DM.responseQueueDomainData <$> lift ask
-  invalidChars <- view DM.invalidCharsDomainData <$> lift ask
-  invalidCmds <- view DM.invalidCmdsDomainData <$> lift ask
-  let nameTmp = dat^.DM.nameDefaultFileSystemCommandData
-      argsBS = DM.unRawJsonByteString $ dat^.DM.argumentsDefaultFileSystemCommandData
-  args <- liftEither $ eitherDecode $ argsBS
-  
-  name <- liftIOE $ DM.validateCommand invalidChars invalidCmds nameTmp
-  argsStr <- liftIOE $ DM.validateArg invalidChars $ args^.argumentsStringToolParams
-#ifdef mingw32_HOST_OS
-  let scriptExt = ".bat"
-#else
-  let scriptExt = ".sh"
-#endif
 
-  let cmd = "\"" ++ toolsDir </> name ++ scriptExt ++ "\" " ++ argsStr
-
-  $logDebugS DM._LOGTAG $ T.pack $ "cmdRunTask: system cmd. " ++ cmd
-  return $ cmdRunTask resQ dat cmd
-
+  $logDebugS DM._LOGTAG $ T.pack $ "readFileTask: path. " ++ abPath
+  return $ readFileTask resQ dat abPath
 
 -- |
 --   
-cmdRunTask :: STM.TQueue DM.McpResponse -> DM.DefaultFileSystemCommandData -> String -> IOTask ()
-cmdRunTask resQ cmdDat cmd = flip E.catchAny errHdl $ do
-  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.cmdRunTask run. " ++ cmd
-  let tout = 30 * 1000 * 1000
+readFileTask :: STM.TQueue DM.McpResponse -> DM.ReadFileFileSystemCommandData -> String -> IOTask ()
+readFileTask resQ cmdDat path = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.readFileTask run. " ++ path
 
---  race (readCreateProcessWithExitCode (shell cmd) "") (CC.threadDelay tout) >>= \case
-  race (runCommandBS cmd) (CC.threadDelay tout) >>= \case
-    Left (code, out, err)  -> response code out err
-    Right _ -> E.throwString "timeout occurred."
+  txt <- TIO.readFile path
+  let contents = path ++ "\n\n" ++ T.unpack txt
+  response ExitSuccess contents ""
 
-  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.cmdRunTask end."
+  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.readFileTask end."
 
   where
     errHdl :: E.SomeException -> IO ()
-    errHdl e = response (ExitFailure 1) "" $ TE.encodeUtf8 . T.pack $ show e
+    errHdl e = response (ExitFailure 1) "" (show e)
 
-    response :: ExitCode -> BS.ByteString -> BS.ByteString -> IO ()
-    response code outBS errBS = do
-      let outStr = T.unpack $ TE.decodeUtf8With TEE.lenientDecode outBS
-          errStr = T.unpack $ TE.decodeUtf8With TEE.lenientDecode errBS
-          jsonRpc = cmdDat^.DM.jsonrpcDefaultFileSystemCommandData
-          content =
-            case (decodeStrict' outBS) of
-              Just val -> [
-                  val
-                , DM.McpToolsCallResponseResultContent "text" errStr
-                ]
-              Nothing -> [
-                  DM.McpToolsCallResponseResultContent "text" outStr
-                , DM.McpToolsCallResponseResultContent "text" errStr
-                ]
-
-          -- content = [
-          --   "{\"type\":\"text\",\"text\":\"" ++ outStr ++ "\"}"
-          -- , "{\"type\":\"text\",\"text\":\"" ++ errStr ++ "\"}"
-          -- ]
-
+    response :: ExitCode -> String -> String -> IO ()
+    response code outStr errStr = do
+      let jsonRpc = cmdDat^.DM.jsonrpcReadFileFileSystemCommandData
+          content = [ DM.McpToolsCallResponseResultContent "text" outStr
+                    , DM.McpToolsCallResponseResultContent "text" errStr
+                    ]
           result = DM.McpToolsCallResponseResult {
                       DM._contentMcpToolsCallResponseResult = content
                     , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
@@ -215,3 +252,74 @@ cmdRunTask resQ cmdDat cmd = flip E.catchAny errHdl $ do
           res = DM.McpToolsCallResponse resDat
 
       STM.atomically $ STM.writeTQueue resQ res
+
+
+---------------------------------------------------------------------------------
+-- |
+--
+genWriteFileTask :: DM.WriteFileFileSystemCommandData -> AppContext (IOTask ())
+genWriteFileTask dat = do
+  let argsBS   = DM.unRawJsonByteString $ dat^.DM.argumentsWriteFileFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode $ argsBS
+
+  let path = argsDat^.pathWriteFileParams
+      contents = argsDat^.contentsWriteFileParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ <- view DM.responseQueueDomainData <$> lift ask
+  writableDir <- view DM.writableDirDomainData <$> lift ask 
+
+  when (not (permitedPath writableDir abPath))
+    $ E.throwString $ "genWriteFileTask: path is not under writableDir. path: " ++ abPath
+
+  let maxWriteSize = 1024 * 1024  -- 1MB
+      bs = TE.encodeUtf8 (T.pack contents)
+      size = BS.length bs
+
+  when (size > maxWriteSize)
+    $ E.throwString $ "writeFileTask: contents size exceeds limit (1MB). size=" ++ show size
+
+  $logDebugS DM._LOGTAG $ T.pack $ "writeFileTask: path : " ++ abPath
+  return $ writeFileTask resQ dat abPath contents
+
+  where
+    permitedPath :: Maybe String -> String -> Bool
+    permitedPath Nothing _ = False
+    permitedPath (Just wd) p =
+      let wd' = addTrailingPathSeparator (normalise wd)
+          p'  = normalise p
+      in wd' `isPrefixOf` p'
+
+-- |
+--   
+writeFileTask :: STM.TQueue DM.McpResponse -> DM.WriteFileFileSystemCommandData -> String -> String -> IOTask ()
+writeFileTask resQ cmdDat path contents = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.writeFileTask run. " ++ path
+
+  createDirectoryIfMissing True (takeDirectory path)
+
+  TIO.writeFile path (T.pack contents)
+
+  response ExitSuccess path ""
+
+  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.writeFileTask end."
+
+  where
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = response (ExitFailure 1) "" (show e)
+
+    response :: ExitCode -> String -> String -> IO ()
+    response code outStr errStr = do
+      let jsonRpc = cmdDat^.DM.jsonrpcWriteFileFileSystemCommandData
+          content = [ DM.McpToolsCallResponseResultContent "text" outStr
+                    , DM.McpToolsCallResponseResultContent "text" errStr
+                    ]
+          result = DM.McpToolsCallResponseResult {
+                      DM._contentMcpToolsCallResponseResult = content
+                    , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
+                    }
+          resDat = DM.McpToolsCallResponseData jsonRpc result
+          res = DM.McpToolsCallResponse resDat
+
+      STM.atomically $ STM.writeTQueue resQ res
+

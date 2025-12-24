@@ -35,15 +35,70 @@ type IOTask = IO
 --------------------------------------------------------------------------------------------
 -- |
 --
-data StringToolParams =
-  StringToolParams {
-    _argumentsStringToolParams :: String
+data DirEntry =
+  DirEntry {
+    _nameDirEntry :: String
+  , _paathDirEntry :: String
+  , _typeDirEntry :: String
+  , _sizeDirEntry :: Maybe Int
   } deriving (Show, Read, Eq)
 
-$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "StringToolParams", omitNothingFields = True} ''StringToolParams)
-makeLenses ''StringToolParams
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "DirEntry", omitNothingFields = True} ''DirEntry)
+makeLenses ''DirEntry
 
-instance Default StringToolParams where
-  def = StringToolParams {
-        _argumentsStringToolParams = def
+instance Default DirEntry where
+  def = DirEntry {
+        _nameDirEntry  = def
+      , _paathDirEntry = def
+      , _typeDirEntry  = def
+      , _sizeDirEntry  = def
       }
+
+
+-- |
+--
+data DirListParams =
+  DirListParams {
+    _pathDirListParams :: String
+  } deriving (Show, Read, Eq)
+
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "DirListParams", omitNothingFields = True} ''DirListParams)
+makeLenses ''DirListParams
+
+instance Default DirListParams where
+  def = DirListParams {
+        _pathDirListParams = def
+      }
+
+-- |
+--
+data ReadFileParams =
+  ReadFileParams {
+    _pathReadFileParams :: String
+  } deriving (Show, Read, Eq)
+
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "ReadFileParams", omitNothingFields = True} ''ReadFileParams)
+makeLenses ''ReadFileParams
+
+instance Default ReadFileParams where
+  def = ReadFileParams {
+        _pathReadFileParams = def
+      }
+
+-- |
+--
+data WriteFileParams =
+  WriteFileParams {
+    _pathWriteFileParams :: String
+  , _contentsWriteFileParams :: String
+  } deriving (Show, Read, Eq)
+
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "WriteFileParams", omitNothingFields = True} ''WriteFileParams)
+makeLenses ''WriteFileParams
+
+instance Default WriteFileParams where
+  def = WriteFileParams {
+        _pathWriteFileParams     = def
+      , _contentsWriteFileParams = def
+      }
+
