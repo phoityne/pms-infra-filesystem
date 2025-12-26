@@ -12,6 +12,8 @@ import System.Exit
 import Control.Lens
 import System.Process
 import System.IO
+import qualified Data.List as L
+import System.FilePath
 import qualified Data.ByteString as BS
 
 import qualified PMS.Domain.Model.DM.Type as DM
@@ -88,3 +90,13 @@ runCommandBS cmd = do
     err <- BS.hGetContents herr
     exitCode <- waitForProcess ph
     return (exitCode, out, err)
+
+
+-- |
+--
+permitedPath :: Maybe String -> String -> Bool
+permitedPath Nothing _ = False
+permitedPath (Just wd) p =
+  let wd' = addTrailingPathSeparator (normalise wd)
+      p'  = normalise p
+  in wd' `L.isPrefixOf` p'

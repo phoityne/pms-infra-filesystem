@@ -17,7 +17,6 @@ import Data.Conduit
 import Control.Concurrent.Async
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import           Data.List (isPrefixOf)
 import Control.Monad.Except
 import System.Directory
 import System.FilePath
@@ -27,6 +26,7 @@ import System.Exit
 import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
+import qualified Data.Text.Encoding.Error as TEE
 
 import qualified PMS.Domain.Model.DM.Type as DM
 import qualified PMS.Domain.Model.DM.Constant as DM
@@ -77,7 +77,7 @@ cmd2task = await >>= \case
 
     go :: DM.FileSystemCommand -> AppContext (IOTask ())
     go (DM.EchoFileSystemCommand dat) = genEchoTask dat
-    go (DM.DirListFileSystemCommand dat) = genDirListTask dat
+    go (DM.ListDirFileSystemCommand dat) = genListDirTask dat
     go (DM.ReadFileFileSystemCommand dat) = genReadFileTask dat
     go (DM.WriteFileFileSystemCommand dat) = genWriteFileTask dat
 
@@ -138,35 +138,38 @@ echoTask resQ cmdDat val = flip E.catchAny errHdl $ do
 ---------------------------------------------------------------------------------
 -- |
 --
-genDirListTask :: DM.DirListFileSystemCommandData -> AppContext (IOTask ())
-genDirListTask dat = do
-  let argsBS   = DM.unRawJsonByteString $ dat^.DM.argumentsDirListFileSystemCommandData
+genListDirTask :: DM.ListDirFileSystemCommandData -> AppContext (IOTask ())
+genListDirTask dat = do
+  let argsBS   = DM.unRawJsonByteString $ dat^.DM.argumentsListDirFileSystemCommandData
   argsDat <- liftEither $ eitherDecode $ argsBS
 
-  let path = argsDat^.pathDirListParams
+  let path = argsDat^.pathListDirParams
   abPath <- liftIO $ makeAbsolute path
 
   resQ <- view DM.responseQueueDomainData <$> lift ask
 
-  $logDebugS DM._LOGTAG $ T.pack $ "dirListTask: " ++ abPath
-  return $ dirListTask resQ dat abPath
+  $logDebugS DM._LOGTAG $ T.pack $ "listDirTask: " ++ abPath
+  return $ listDirTask resQ dat abPath
 
 -- |
 --   
-dirListTask :: STM.TQueue DM.McpResponse -> DM.DirListFileSystemCommandData -> String -> IOTask ()
-dirListTask resQ cmdDat path = flip E.catchAny errHdl $ do
-  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.dirListTask run. " ++ path
+listDirTask :: STM.TQueue DM.McpResponse -> DM.ListDirFileSystemCommandData -> String -> IOTask ()
+listDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.listDirTask run. " ++ path
 
   names <- listDirectory path
 
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.listDirTask entries." ++ show names
+
   entries <- mapM (mkEntry path) names
 
-  let entriesJson :: String
-      entriesJson = BL.unpack (encode entries)
+  let entriesJson = T.unpack (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (encode entries))) -- BL.unpack (encode entries)
+
+  hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.listDirTask entriesJson." ++ show entriesJson
 
   response ExitSuccess entriesJson ""
 
-  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.dirListTask end."
+  hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.listDirTask end."
 
   where
     errHdl :: E.SomeException -> IO ()
@@ -174,7 +177,7 @@ dirListTask resQ cmdDat path = flip E.catchAny errHdl $ do
 
     response :: ExitCode -> String -> String -> IO ()
     response code outStr errStr = do
-      let jsonRpc = cmdDat^.DM.jsonrpcDirListFileSystemCommandData
+      let jsonRpc = cmdDat^.DM.jsonrpcListDirFileSystemCommandData
       
           content = [ DM.McpToolsCallResponseResultContent "text" outStr
                     , DM.McpToolsCallResponseResultContent "text" errStr
@@ -206,6 +209,12 @@ dirListTask resQ cmdDat path = flip E.catchAny errHdl $ do
            , _sizeDirEntry  = mSize
            }
 
+    toStrictUtf8String :: String -> String
+    toStrictUtf8String = T.unpack 
+                       . TE.decodeUtf8With TEE.lenientDecode 
+                       . TE.encodeUtf8 
+                       . T.pack
+
 ---------------------------------------------------------------------------------
 -- |
 --
@@ -228,8 +237,10 @@ readFileTask :: STM.TQueue DM.McpResponse -> DM.ReadFileFileSystemCommandData ->
 readFileTask resQ cmdDat path = flip E.catchAny errHdl $ do
   hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.readFileTask run. " ++ path
 
-  txt <- TIO.readFile path
-  let contents = path ++ "\n\n" ++ T.unpack txt
+  txtBs <- BS.readFile path
+  let txt = TE.decodeUtf8With TEE.lenientDecode txtBs
+      contents = path ++ "\n\n" ++ T.unpack txt
+
   response ExitSuccess contents ""
 
   hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.readFileTask end."
@@ -281,14 +292,6 @@ genWriteFileTask dat = do
 
   $logDebugS DM._LOGTAG $ T.pack $ "writeFileTask: path : " ++ abPath
   return $ writeFileTask resQ dat abPath contents
-
-  where
-    permitedPath :: Maybe String -> String -> Bool
-    permitedPath Nothing _ = False
-    permitedPath (Just wd) p =
-      let wd' = addTrailingPathSeparator (normalise wd)
-          p'  = normalise p
-      in wd' `isPrefixOf` p'
 
 -- |
 --   

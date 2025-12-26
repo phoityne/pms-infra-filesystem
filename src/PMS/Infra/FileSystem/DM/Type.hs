@@ -57,17 +57,17 @@ instance Default DirEntry where
 
 -- |
 --
-data DirListParams =
-  DirListParams {
-    _pathDirListParams :: String
+data ListDirParams =
+  ListDirParams {
+    _pathListDirParams :: String
   } deriving (Show, Read, Eq)
 
-$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "DirListParams", omitNothingFields = True} ''DirListParams)
-makeLenses ''DirListParams
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "ListDirParams", omitNothingFields = True} ''ListDirParams)
+makeLenses ''ListDirParams
 
-instance Default DirListParams where
-  def = DirListParams {
-        _pathDirListParams = def
+instance Default ListDirParams where
+  def = ListDirParams {
+        _pathListDirParams = def
       }
 
 -- |
