@@ -146,6 +146,10 @@ genListDirTask dat = do
   let path = argsDat^.pathListDirParams
   abPath <- liftIO $ makeAbsolute path
 
+  sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
+  when (not (permitedPath sandboxDir abPath))
+    $ E.throwString $ "genListDirTask: path is not under sandboxDir. path: " ++ abPath
+
   resQ <- view DM.responseQueueDomainData <$> lift ask
 
   $logDebugS DM._LOGTAG $ T.pack $ "listDirTask: " ++ abPath
@@ -209,11 +213,6 @@ listDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
            , _sizeDirEntry  = mSize
            }
 
-    toStrictUtf8String :: String -> String
-    toStrictUtf8String = T.unpack 
-                       . TE.decodeUtf8With TEE.lenientDecode 
-                       . TE.encodeUtf8 
-                       . T.pack
 
 ---------------------------------------------------------------------------------
 -- |
@@ -225,6 +224,10 @@ genReadFileTask dat = do
 
   let path = argsDat^.pathReadFileParams
   abPath <- liftIO $ makeAbsolute path
+
+  sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
+  when (not (permitedPath sandboxDir abPath))
+    $ E.throwString $ "genReadFileTask: path is not under sandboxDir. path: " ++ abPath
 
   resQ <- view DM.responseQueueDomainData <$> lift ask
 
@@ -278,10 +281,10 @@ genWriteFileTask dat = do
   abPath <- liftIO $ makeAbsolute path
 
   resQ <- view DM.responseQueueDomainData <$> lift ask
-  writableDir <- view DM.writableDirDomainData <$> lift ask 
+  sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
 
-  when (not (permitedPath writableDir abPath))
-    $ E.throwString $ "genWriteFileTask: path is not under writableDir. path: " ++ abPath
+  when (not (permitedPath sandboxDir abPath))
+    $ E.throwString $ "genWriteFileTask: path is not under sandboxDir. path: " ++ abPath
 
   let maxWriteSize = 1024 * 1024  -- 1MB
       bs = TE.encodeUtf8 (T.pack contents)
