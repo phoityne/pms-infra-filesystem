@@ -97,6 +97,8 @@ runCommandBS cmd = do
 permitedPath :: Maybe String -> String -> Bool
 permitedPath Nothing _ = False
 permitedPath (Just wd) p =
-  let wd' = addTrailingPathSeparator (normalise wd)
-      p'  = normalise p
-  in wd' `L.isPrefixOf` p'
+  let wdN = normalise wd
+      pN  = normalise p
+      wd' = addTrailingPathSeparator wdN
+  in  wdN == pN
+      || wd' `L.isPrefixOf` pN

@@ -98,6 +98,7 @@ sink = await >>= \case
       $logWarnS DM._LOGTAG $ T.pack $ "sink: exception occurred. skip. " ++ msg
       sink
 
+
     go :: (IO ()) -> AppContext ()
     go t = do
       $logDebugS DM._LOGTAG "sink: start async."
@@ -148,7 +149,7 @@ genListDirTask dat = do
 
   sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
   when (not (permitedPath sandboxDir abPath))
-    $ E.throwString $ "genListDirTask: path is not under sandboxDir. path: " ++ abPath
+    $ throwError $ "genListDirTask: path is not under sandboxDir. path: " ++ abPath
 
   resQ <- view DM.responseQueueDomainData <$> lift ask
 
@@ -227,7 +228,7 @@ genReadFileTask dat = do
 
   sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
   when (not (permitedPath sandboxDir abPath))
-    $ E.throwString $ "genReadFileTask: path is not under sandboxDir. path: " ++ abPath
+    $ throwError $ "genReadFileTask: path is not under sandboxDir. path: " ++ abPath
 
   resQ <- view DM.responseQueueDomainData <$> lift ask
 
@@ -284,14 +285,14 @@ genWriteFileTask dat = do
   sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
 
   when (not (permitedPath sandboxDir abPath))
-    $ E.throwString $ "genWriteFileTask: path is not under sandboxDir. path: " ++ abPath
+    $ throwError $ "genWriteFileTask: path is not under sandboxDir. path: " ++ abPath
 
   let maxWriteSize = 1024 * 1024  -- 1MB
       bs = TE.encodeUtf8 (T.pack contents)
       size = BS.length bs
 
   when (size > maxWriteSize)
-    $ E.throwString $ "writeFileTask: contents size exceeds limit (1MB). size=" ++ show size
+    $ throwError $ "writeFileTask: contents size exceeds limit (1MB). size=" ++ show size
 
   $logDebugS DM._LOGTAG $ T.pack $ "writeFileTask: path : " ++ abPath
   return $ writeFileTask resQ dat abPath contents
