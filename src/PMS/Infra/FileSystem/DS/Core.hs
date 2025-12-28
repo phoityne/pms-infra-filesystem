@@ -16,7 +16,6 @@ import qualified Control.Concurrent.STM as STM
 import Data.Conduit
 import Control.Concurrent.Async
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
 import Control.Monad.Except
 import System.Directory
 import System.FilePath
@@ -305,7 +304,8 @@ writeFileTask resQ cmdDat path contents = flip E.catchAny errHdl $ do
 
   createDirectoryIfMissing True (takeDirectory path)
 
-  TIO.writeFile path (T.pack contents)
+  let bs = TE.encodeUtf8 (T.pack contents)
+  BS.writeFile path bs
 
   response ExitSuccess path ""
 
