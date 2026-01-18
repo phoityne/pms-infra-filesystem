@@ -70,6 +70,23 @@ instance Default ListDirParams where
         _pathListDirParams = def
       }
 
+
+-- |
+--
+data MakeDirParams =
+  MakeDirParams {
+    _pathMakeDirParams :: String
+  } deriving (Show, Read, Eq)
+
+$(deriveJSON defaultOptions {fieldLabelModifier = DM.dropDataName "MakeDirParams", omitNothingFields = True} ''MakeDirParams)
+makeLenses ''MakeDirParams
+
+instance Default MakeDirParams where
+  def = MakeDirParams {
+        _pathMakeDirParams = def
+      }
+
+
 -- |
 --
 data ReadFileParams =

@@ -77,6 +77,7 @@ cmd2task = await >>= \case
     go :: DM.FileSystemCommand -> AppContext (IOTask ())
     go (DM.EchoFileSystemCommand dat) = genEchoTask dat
     go (DM.ListDirFileSystemCommand dat) = genListDirTask dat
+    go (DM.MakeDirFileSystemCommand dat) = genMakeDirTask dat
     go (DM.ReadFileFileSystemCommand dat) = genReadFileTask dat
     go (DM.WriteFileFileSystemCommand dat) = genWriteFileTask dat
 
@@ -212,6 +213,69 @@ listDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
            , _typeDirEntry  = if isDir then "directory" else "file"
            , _sizeDirEntry  = mSize
            }
+
+
+---------------------------------------------------------------------------------
+-- |
+--
+genMakeDirTask :: DM.MakeDirFileSystemCommandData -> AppContext (IOTask ())
+genMakeDirTask dat = do
+  let argsBS = DM.unRawJsonByteString
+             $ dat^.DM.argumentsMakeDirFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode argsBS
+
+  let path = argsDat^.pathMakeDirParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ <- view DM.responseQueueDomainData <$> lift ask
+  sandboxDir <- view DM.sandboxDirDomainData <$> lift ask
+
+  when (not (permitedPath sandboxDir abPath)) $
+    throwError $
+      "genMakeDirTask: path is not under sandboxDir. path: " ++ abPath
+
+  $logDebugS DM._LOGTAG $
+    T.pack $ "makeDirTask: path : " ++ abPath
+
+  return $ makeDirTask resQ dat abPath
+
+-- |
+--   
+makeDirTask :: STM.TQueue DM.McpResponse
+            -> DM.MakeDirFileSystemCommandData
+            -> String
+            -> IOTask ()
+makeDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $
+    "[INFO] PMS.Infra.FileSystem.DS.Core.work.makeDirTask run. " ++ path
+
+  -- mkdir -p 相当
+  createDirectoryIfMissing True path
+
+  response ExitSuccess path ""
+
+  hPutStrLn stderr
+    "[INFO] PMS.Infra.FileSystem.DS.Core.work.makeDirTask end."
+
+  where
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = response (ExitFailure 1) "" (show e)
+
+    response :: ExitCode -> String -> String -> IO ()
+    response code outStr errStr = do
+      let jsonRpc = cmdDat^.DM.jsonrpcMakeDirFileSystemCommandData
+          content =
+            [ DM.McpToolsCallResponseResultContent "text" outStr
+            , DM.McpToolsCallResponseResultContent "text" errStr
+            ]
+          result = DM.McpToolsCallResponseResult
+            { DM._contentMcpToolsCallResponseResult = content
+            , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
+            }
+          resDat = DM.McpToolsCallResponseData jsonRpc result
+          res    = DM.McpToolsCallResponse resDat
+
+      STM.atomically $ STM.writeTQueue resQ res
 
 
 ---------------------------------------------------------------------------------
