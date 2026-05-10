@@ -10,7 +10,7 @@ import Control.Monad
 import Control.Monad.Logger
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
-import Control.Lens
+import Control.Lens hiding ((.=))
 import Control.Monad.Reader
 import qualified Control.Concurrent.STM as STM
 import Data.Conduit
@@ -26,6 +26,8 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Text.Encoding.Error as TEE
+import AIAgent.DiffPatch.Unified (patchFile)
+import Text.Regex.TDFA (getAllMatches, (=~), AllMatches(..))
 
 import qualified PMS.Domain.Model.DM.Type as DM
 import qualified PMS.Domain.Model.DM.Constant as DM
@@ -75,11 +77,15 @@ cmd2task = await >>= \case
       cmd2task
 
     go :: DM.FileSystemCommand -> AppContext (IOTask ())
-    go (DM.EchoFileSystemCommand dat) = genEchoTask dat
-    go (DM.ListDirFileSystemCommand dat) = genListDirTask dat
-    go (DM.MakeDirFileSystemCommand dat) = genMakeDirTask dat
-    go (DM.ReadFileFileSystemCommand dat) = genReadFileTask dat
+    go (DM.EchoFileSystemCommand dat)      = genEchoTask dat
+    go (DM.ListDirFileSystemCommand dat)   = genListDirTask dat
+    go (DM.MakeDirFileSystemCommand dat)   = genMakeDirTask dat
+    go (DM.ReadFileFileSystemCommand dat)  = genReadFileTask dat
     go (DM.WriteFileFileSystemCommand dat) = genWriteFileTask dat
+    go (DM.PatchFileFileSystemCommand dat) = genPatchFileTask dat
+    go (DM.FileInfoFileSystemCommand dat)  = genFileInfoTask dat
+    go (DM.GrepFileFileSystemCommand dat)  = genGrepFileTask dat
+    go (DM.ReplaceFileFileSystemCommand dat) = genReplaceFileTask dat
 
 ---------------------------------------------------------------------------------
 -- |
@@ -127,13 +133,212 @@ echoTask :: STM.TQueue DM.McpResponse -> DM.EchoFileSystemCommandData -> String 
 echoTask resQ cmdDat val = flip E.catchAny errHdl $ do
   hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.echoTask run. " ++ val
 
-  toolsCallResponse resQ (cmdDat^.DM.jsonrpcEchoFileSystemCommandData) ExitSuccess val ""
+  toolsCallResponse resQ jsonRpc ExitSuccess val ""
 
   hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.echoTask end."
 
   where
+    jsonRpc = cmdDat^.DM.jsonrpcEchoFileSystemCommandData
+
     errHdl :: E.SomeException -> IO ()
-    errHdl e = toolsCallResponse resQ (cmdDat^.DM.jsonrpcEchoFileSystemCommandData) (ExitFailure 1) "" (show e)
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
+
+
+---------------------------------------------------------------------------------
+-- | Generate an IO task that returns file info (line count, byte size).
+genFileInfoTask :: DM.FileInfoFileSystemCommandData -> AppContext (IOTask ())
+genFileInfoTask dat = do
+  let argsBS = DM.unRawJsonByteString
+             $ dat^.DM.argumentsFileInfoFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode argsBS
+
+  let path = argsDat^.pathFileInfoParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ       <- view DM.responseQueueDomainData <$> lift ask
+  sandboxDir <- view DM.sandboxDirDomainData    <$> lift ask
+
+  when (not (permitedPath sandboxDir abPath)) $
+    throwError $
+      "genFileInfoTask: path is not under sandboxDir. path: " ++ abPath
+
+  $logDebugS DM._LOGTAG $
+    T.pack $ "fileInfoTask: path : " ++ abPath
+  return $ fileInfoTask resQ dat abPath
+
+-- | Return line count and byte size of the file at the given absolute path.
+fileInfoTask :: STM.TQueue DM.McpResponse
+             -> DM.FileInfoFileSystemCommandData
+             -> String   -- ^ absolute path of the target file
+             -> IOTask ()
+fileInfoTask resQ cmdDat path = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $
+    "[INFO] PMS.Infra.FileSystem.DS.Core.fileInfoTask run. " ++ path
+
+  bs <- BS.readFile path
+  let byteSize  = BS.length bs
+      txt       = TE.decodeUtf8With TEE.lenientDecode bs
+      lineCount = length (T.lines txt)
+      outJson   = BL.unpack $ encode $ object
+                    [ "lines" .= lineCount
+                    , "bytes" .= byteSize
+                    ]
+
+  toolsCallResponse resQ jsonRpc ExitSuccess outJson ""
+
+  hPutStrLn stderr
+    "[INFO] PMS.Infra.FileSystem.DS.Core.fileInfoTask end."
+
+  where
+    jsonRpc = cmdDat^.DM.jsonrpcFileInfoFileSystemCommandData
+
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
+
+
+---------------------------------------------------------------------------------
+-- | Generate an IO task that greps a file for lines matching a regex pattern.
+genGrepFileTask :: DM.GrepFileFileSystemCommandData -> AppContext (IOTask ())
+genGrepFileTask dat = do
+  let argsBS = DM.unRawJsonByteString
+             $ dat^.DM.argumentsGrepFileFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode argsBS
+
+  let path = argsDat^.pathGrepFileParams
+      pat  = argsDat^.patternGrepFileParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ       <- view DM.responseQueueDomainData <$> lift ask
+  sandboxDir <- view DM.sandboxDirDomainData    <$> lift ask
+
+  when (not (permitedPath sandboxDir abPath)) $
+    throwError $
+      "genGrepFileTask: path is not under sandboxDir. path: " ++ abPath
+
+  $logDebugS DM._LOGTAG $
+    T.pack $ "grepFileTask: path=" ++ abPath ++ " pattern=" ++ pat
+  return $ grepFileTask resQ dat abPath pat
+
+-- | Compute 1-based column offsets of all matches of pat in a single line.
+colsOf :: String -> String -> [Int]
+colsOf pat line =
+  [ off + 1
+  | (off, _len) <- getAllMatches (line =~ pat :: AllMatches [] (Int, Int))
+  ]
+
+-- | Search a file for lines matching a regex pattern.
+-- Returns a JSON array of GrepFileHit objects.
+-- Returns "[]" when there are no matches.
+grepFileTask :: STM.TQueue DM.McpResponse
+             -> DM.GrepFileFileSystemCommandData
+             -> String   -- ^ absolute path of the target file
+             -> String   -- ^ regex pattern
+             -> IOTask ()
+grepFileTask resQ cmdDat path pat = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $
+    "[INFO] PMS.Infra.FileSystem.DS.Core.grepFileTask run. " ++ path
+
+  txtBs <- BS.readFile path
+  let txt  = TE.decodeUtf8With TEE.lenientDecode txtBs
+      ls   = zip [1..] (T.lines txt)
+      hits = [ GrepFileHit
+                 { _lineGrepFileHit = n
+                 , _textGrepFileHit = l
+                 , _colsGrepFileHit = cols
+                 }
+             | (n, l) <- ls
+             , let cols = colsOf pat (T.unpack l)
+             , not (null cols)
+             ]
+      outJson = T.unpack
+              . TE.decodeUtf8With TEE.lenientDecode
+              . BL.toStrict
+              $ encode hits
+
+  toolsCallResponse resQ jsonRpc ExitSuccess outJson ""
+
+  hPutStrLn stderr
+    "[INFO] PMS.Infra.FileSystem.DS.Core.grepFileTask end."
+
+  where
+    jsonRpc = cmdDat^.DM.jsonrpcGrepFileFileSystemCommandData
+
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
+
+
+---------------------------------------------------------------------------------
+-- | Generate an IO task that replaces literal text in a file.
+genReplaceFileTask :: DM.ReplaceFileFileSystemCommandData -> AppContext (IOTask ())
+genReplaceFileTask dat = do
+  let argsBS = DM.unRawJsonByteString
+             $ dat^.DM.argumentsReplaceFileFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode argsBS
+
+  let path = argsDat^.pathReplaceFileParams
+      reps = argsDat^.replacementsReplaceFileParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ       <- view DM.responseQueueDomainData <$> lift ask
+  sandboxDir <- view DM.sandboxDirDomainData    <$> lift ask
+
+  when (not (permitedPath sandboxDir abPath)) $
+    throwError $
+      "genReplaceFileTask: path is not under sandboxDir. path: " ++ abPath
+
+  $logDebugS DM._LOGTAG $
+    T.pack $ "replaceFileTask: path : " ++ abPath
+  return $ replaceFileTask resQ dat abPath reps
+
+-- | Apply literal replacement rules in order.
+-- The result is all-or-nothing: Left means callers must not write the file.
+applyReplacements :: [Replacement] -> T.Text -> Either String T.Text
+applyReplacements [] _ =
+  Left "replaceFileTask: replacements must not be empty."
+applyReplacements reps txt =
+  foldM go txt reps
+  where
+    go :: T.Text -> Replacement -> Either String T.Text
+    go acc rep =
+      let old = T.pack $ rep^.oldTextReplacement
+          new = T.pack $ rep^.newTextReplacement
+      in  if T.null old
+            then Left "replaceFileTask: oldText must not be empty."
+            else if not (old `T.isInfixOf` acc)
+              then Left "replaceFileTask: oldText not found."
+              else Right $ replaceAllText old new acc
+
+-- | Replace all literal occurrences of old text with new text.
+replaceAllText :: T.Text -> T.Text -> T.Text -> T.Text
+replaceAllText = T.replace
+
+-- | Replace literal text in a file and write only after every rule succeeds.
+replaceFileTask :: STM.TQueue DM.McpResponse
+                -> DM.ReplaceFileFileSystemCommandData
+                -> String
+                -> [Replacement]
+                -> IOTask ()
+replaceFileTask resQ cmdDat path reps = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $
+    "[INFO] PMS.Infra.FileSystem.DS.Core.replaceFileTask run. " ++ path
+
+  txtBs <- BS.readFile path
+  let txt = TE.decodeUtf8With TEE.lenientDecode txtBs
+
+  case applyReplacements reps txt of
+    Left err -> toolsCallResponse resQ jsonRpc (ExitFailure 1) "" err
+    Right replaced -> do
+      BS.writeFile path $ TE.encodeUtf8 replaced
+      toolsCallResponse resQ jsonRpc ExitSuccess path ""
+
+  hPutStrLn stderr
+    "[INFO] PMS.Infra.FileSystem.DS.Core.replaceFileTask end."
+
+  where
+    jsonRpc = cmdDat^.DM.jsonrpcReplaceFileFileSystemCommandData
+
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
 
 ---------------------------------------------------------------------------------
@@ -168,33 +373,19 @@ listDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
 
   entries <- mapM (mkEntry path) names
 
-  let entriesJson = T.unpack (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (encode entries))) -- BL.unpack (encode entries)
+  let entriesJson = T.unpack (TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (encode entries)))
 
   hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.listDirTask entriesJson." ++ show entriesJson
 
-  response ExitSuccess entriesJson ""
+  toolsCallResponse resQ jsonRpc ExitSuccess entriesJson ""
 
   hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.listDirTask end."
 
   where
+    jsonRpc = cmdDat^.DM.jsonrpcListDirFileSystemCommandData
+
     errHdl :: E.SomeException -> IO ()
-    errHdl e = response (ExitFailure 1) "" (show e)
-
-    response :: ExitCode -> String -> String -> IO ()
-    response code outStr errStr = do
-      let jsonRpc = cmdDat^.DM.jsonrpcListDirFileSystemCommandData
-      
-          content = [ DM.McpToolsCallResponseResultContent "text" outStr
-                    , DM.McpToolsCallResponseResultContent "text" errStr
-                    ]
-          result = DM.McpToolsCallResponseResult {
-                      DM._contentMcpToolsCallResponseResult = content
-                    , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
-                    }
-          resDat = DM.McpToolsCallResponseData jsonRpc result
-          res = DM.McpToolsCallResponse resDat
-
-      STM.atomically $ STM.writeTQueue resQ res
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
     mkEntry :: FilePath -> FilePath -> IO DirEntry
     mkEntry base name = do
@@ -208,11 +399,11 @@ listDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
             pure (Just (fromIntegral sz))
 
       pure DirEntry {
-             _nameDirEntry  = name
-           , _paathDirEntry = fullPath
-           , _typeDirEntry  = if isDir then "directory" else "file"
-           , _sizeDirEntry  = mSize
-           }
+              _nameDirEntry  = name
+            , _paathDirEntry = fullPath
+            , _typeDirEntry  = if isDir then "directory" else "file"
+            , _sizeDirEntry  = mSize
+            }
 
 
 ---------------------------------------------------------------------------------
@@ -249,36 +440,33 @@ makeDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
   hPutStrLn stderr $
     "[INFO] PMS.Infra.FileSystem.DS.Core.work.makeDirTask run. " ++ path
 
-  -- mkdir -p 相当
+  -- create parent directories as needed (mkdir -p equivalent)
   createDirectoryIfMissing True path
 
-  response ExitSuccess path ""
+  toolsCallResponse resQ jsonRpc ExitSuccess path ""
 
   hPutStrLn stderr
     "[INFO] PMS.Infra.FileSystem.DS.Core.work.makeDirTask end."
 
   where
+    jsonRpc = cmdDat^.DM.jsonrpcMakeDirFileSystemCommandData
+
     errHdl :: E.SomeException -> IO ()
-    errHdl e = response (ExitFailure 1) "" (show e)
-
-    response :: ExitCode -> String -> String -> IO ()
-    response code outStr errStr = do
-      let jsonRpc = cmdDat^.DM.jsonrpcMakeDirFileSystemCommandData
-          content =
-            [ DM.McpToolsCallResponseResultContent "text" outStr
-            , DM.McpToolsCallResponseResultContent "text" errStr
-            ]
-          result = DM.McpToolsCallResponseResult
-            { DM._contentMcpToolsCallResponseResult = content
-            , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
-            }
-          resDat = DM.McpToolsCallResponseData jsonRpc result
-          res    = DM.McpToolsCallResponse resDat
-
-      STM.atomically $ STM.writeTQueue resQ res
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
 
 ---------------------------------------------------------------------------------
+-- | Pure helper: slice a list of lines by optional 1-based start/end indices.
+-- - Both Nothing  : return the list as-is (no processing needed).
+-- - Either is Just: apply drop/take with clamping.
+sliceLines :: Maybe Int -> Maybe Int -> [T.Text] -> [T.Text]
+sliceLines Nothing  Nothing  ls = ls
+sliceLines mStart   mEnd     ls =
+  let start   = maybe 1        id mStart
+      end     = maybe maxBound id mEnd
+      clamped = min end (length ls)
+  in  take (clamped - start + 1) . drop (start - 1) $ ls
+
 -- |
 --
 genReadFileTask :: DM.ReadFileFileSystemCommandData -> AppContext (IOTask ())
@@ -286,7 +474,9 @@ genReadFileTask dat = do
   let argsBS   = DM.unRawJsonByteString $ dat^.DM.argumentsReadFileFileSystemCommandData
   argsDat <- liftEither $ eitherDecode $ argsBS
 
-  let path = argsDat^.pathReadFileParams
+  let path      = argsDat^.pathReadFileParams
+      startLine = argsDat^.startLineReadFileParams  -- Maybe Int
+      endLine   = argsDat^.endLineReadFileParams    -- Maybe Int
   abPath <- liftIO $ makeAbsolute path
 
   sandboxDir <- view DM.sandboxDirDomainData <$> lift ask 
@@ -296,40 +486,37 @@ genReadFileTask dat = do
   resQ <- view DM.responseQueueDomainData <$> lift ask
 
   $logDebugS DM._LOGTAG $ T.pack $ "readFileTask: path. " ++ abPath
-  return $ readFileTask resQ dat abPath
+  return $ readFileTask resQ dat abPath startLine endLine
 
 -- |
 --   
-readFileTask :: STM.TQueue DM.McpResponse -> DM.ReadFileFileSystemCommandData -> String -> IOTask ()
-readFileTask resQ cmdDat path = flip E.catchAny errHdl $ do
+readFileTask :: STM.TQueue DM.McpResponse
+             -> DM.ReadFileFileSystemCommandData
+             -> String    -- ^ absolute path
+             -> Maybe Int -- ^ startLine (1-based, inclusive). Nothing = from beginning
+             -> Maybe Int -- ^ endLine   (1-based, inclusive). Nothing = to end
+             -> IOTask ()
+readFileTask resQ cmdDat path mStart mEnd = flip E.catchAny errHdl $ do
   hPutStrLn stderr $ "[INFO] PMS.Infra.FileSystem.DS.Core.work.readFileTask run. " ++ path
 
   txtBs <- BS.readFile path
-  let txt = TE.decodeUtf8With TEE.lenientDecode txtBs
-      contents = path ++ "\n\n" ++ T.unpack txt
+  let txt  = TE.decodeUtf8With TEE.lenientDecode txtBs
+      -- Both Nothing: return file content as-is (no line split/join, full backward compat).
+      -- Either Just: apply line slicing.
+      body = case (mStart, mEnd) of
+               (Nothing, Nothing) -> T.unpack txt
+               _                  -> T.unpack . T.unlines . sliceLines mStart mEnd . T.lines $ txt
+      contents = path ++ "\n\n" ++ body
 
-  response ExitSuccess contents ""
+  toolsCallResponse resQ jsonRpc ExitSuccess contents ""
 
   hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.readFileTask end."
 
   where
+    jsonRpc = cmdDat^.DM.jsonrpcReadFileFileSystemCommandData
+
     errHdl :: E.SomeException -> IO ()
-    errHdl e = response (ExitFailure 1) "" (show e)
-
-    response :: ExitCode -> String -> String -> IO ()
-    response code outStr errStr = do
-      let jsonRpc = cmdDat^.DM.jsonrpcReadFileFileSystemCommandData
-          content = [ DM.McpToolsCallResponseResultContent "text" outStr
-                    , DM.McpToolsCallResponseResultContent "text" errStr
-                    ]
-          result = DM.McpToolsCallResponseResult {
-                      DM._contentMcpToolsCallResponseResult = content
-                    , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
-                    }
-          resDat = DM.McpToolsCallResponseData jsonRpc result
-          res = DM.McpToolsCallResponse resDat
-
-      STM.atomically $ STM.writeTQueue resQ res
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
 
 ---------------------------------------------------------------------------------
@@ -371,26 +558,62 @@ writeFileTask resQ cmdDat path contents = flip E.catchAny errHdl $ do
   let bs = TE.encodeUtf8 (T.pack contents)
   BS.writeFile path bs
 
-  response ExitSuccess path ""
+  toolsCallResponse resQ jsonRpc ExitSuccess path ""
 
   hPutStrLn stderr "[INFO] PMS.Infra.FileSystem.DS.Core.work.writeFileTask end."
 
   where
+    jsonRpc = cmdDat^.DM.jsonrpcWriteFileFileSystemCommandData
+
     errHdl :: E.SomeException -> IO ()
-    errHdl e = response (ExitFailure 1) "" (show e)
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)
 
-    response :: ExitCode -> String -> String -> IO ()
-    response code outStr errStr = do
-      let jsonRpc = cmdDat^.DM.jsonrpcWriteFileFileSystemCommandData
-          content = [ DM.McpToolsCallResponseResultContent "text" outStr
-                    , DM.McpToolsCallResponseResultContent "text" errStr
-                    ]
-          result = DM.McpToolsCallResponseResult {
-                      DM._contentMcpToolsCallResponseResult = content
-                    , DM._isErrorMcpToolsCallResponseResult = (ExitSuccess /= code)
-                    }
-          resDat = DM.McpToolsCallResponseData jsonRpc result
-          res = DM.McpToolsCallResponse resDat
 
-      STM.atomically $ STM.writeTQueue resQ res
+---------------------------------------------------------------------------------
+-- | Generate an IO task that applies a unified diff patch to a file.
+-- Validates sandbox restriction before returning the task.
+genPatchFileTask :: DM.PatchFileFileSystemCommandData -> AppContext (IOTask ())
+genPatchFileTask dat = do
+  let argsBS = DM.unRawJsonByteString
+             $ dat^.DM.argumentsPatchFileFileSystemCommandData
+  argsDat <- liftEither $ eitherDecode argsBS
 
+  let path = argsDat^.pathPatchFileParams
+      ptch = argsDat^.patchPatchFileParams
+  abPath <- liftIO $ makeAbsolute path
+
+  resQ       <- view DM.responseQueueDomainData <$> lift ask
+  sandboxDir <- view DM.sandboxDirDomainData    <$> lift ask
+
+  when (not (permitedPath sandboxDir abPath)) $
+    throwError $
+      "genPatchFileTask: path is not under sandboxDir. path: " ++ abPath
+
+  $logDebugS DM._LOGTAG $
+    T.pack $ "patchFileTask: path : " ++ abPath
+  return $ patchFileTask resQ dat abPath ptch
+
+-- | Apply a unified diff patch to the file at the given absolute path.
+-- On success returns the file path in stdout; on failure returns the error in stderr.
+patchFileTask :: STM.TQueue DM.McpResponse
+             -> DM.PatchFileFileSystemCommandData
+             -> String   -- ^ absolute path of the target file
+             -> String   -- ^ unified diff patch string
+             -> IOTask ()
+patchFileTask resQ cmdDat path ptch = flip E.catchAny errHdl $ do
+  hPutStrLn stderr $
+    "[INFO] PMS.Infra.FileSystem.DS.Core.patchFileTask run. " ++ path
+
+  result <- patchFile path ptch
+  case result of
+    Left  err -> toolsCallResponse resQ jsonRpc (ExitFailure 1) "" err
+    Right ()  -> toolsCallResponse resQ jsonRpc ExitSuccess path ""
+
+  hPutStrLn stderr
+    "[INFO] PMS.Infra.FileSystem.DS.Core.patchFileTask end."
+
+  where
+    jsonRpc = cmdDat^.DM.jsonrpcPatchFileFileSystemCommandData
+
+    errHdl :: E.SomeException -> IO ()
+    errHdl e = toolsCallResponse resQ jsonRpc (ExitFailure 1) "" (show e)

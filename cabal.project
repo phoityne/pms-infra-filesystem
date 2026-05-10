@@ -1,3 +1,4 @@
 packages:
   ./
   ../pms-domain-model
+  ../ai-agent-diff-patch

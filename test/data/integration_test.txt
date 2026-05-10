@@ -1,0 +1,14 @@
+# integration test file
+## section A
+line A-1
+line A-2 [PATCHED]
+line A-3 [HUNK1]
+## section B
+line B-1
+line B-2 [HUNK2]
+line B-3
+
+## section C (日本語セクション)
+こんにちは
+日本語の世界
+さようなら

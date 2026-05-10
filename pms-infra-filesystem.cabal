@@ -20,7 +20,7 @@ name:               pms-infra-filesystem
 -- PVP summary:     +-+------- breaking API changes
 --                  | | +----- non-breaking API additions
 --                  | | | +--- code changes with no API change
-version:            0.0.2.0
+version:            0.0.3.0
 
 -- A short (one-line) description of the package.
 synopsis:           pms-infra-filesystem
@@ -90,7 +90,9 @@ library
                       filepath,
                       aeson,
                       directory,
-                      pms-domain-model
+                      pms-domain-model,
+                      ai-agent-diff-patch,
+                      regex-tdfa
 
     -- Directories containing source files.
     hs-source-dirs:   src
@@ -129,10 +131,11 @@ test-suite pms-infra-filesystem-test
                       stm,
                       monad-logger,
                       async,
-                      unix,
                       lens,
                       filepath,
                       directory,
+                      bytestring,
+                      text,
                       pms-domain-model,
                       pms-infra-filesystem
 
