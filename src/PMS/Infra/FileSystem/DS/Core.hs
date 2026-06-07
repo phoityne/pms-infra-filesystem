@@ -400,7 +400,7 @@ listDirTask resQ cmdDat path = flip E.catchAny errHdl $ do
 
       pure DirEntry {
               _nameDirEntry  = name
-            , _paathDirEntry = fullPath
+            , _pathDirEntry = fullPath
             , _typeDirEntry  = if isDir then "directory" else "file"
             , _sizeDirEntry  = mSize
             }

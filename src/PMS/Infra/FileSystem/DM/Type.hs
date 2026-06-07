@@ -39,7 +39,7 @@ type IOTask = IO
 data DirEntry =
   DirEntry {
     _nameDirEntry :: String
-  , _paathDirEntry :: String
+  , _pathDirEntry :: String
   , _typeDirEntry :: String
   , _sizeDirEntry :: Maybe Int
   } deriving (Show, Read, Eq)
@@ -50,7 +50,7 @@ makeLenses ''DirEntry
 instance Default DirEntry where
   def = DirEntry {
         _nameDirEntry  = def
-      , _paathDirEntry = def
+      , _pathDirEntry = def
       , _typeDirEntry  = def
       , _sizeDirEntry  = def
       }

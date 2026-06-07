@@ -1,5 +1,9 @@
 # Revision history for pms-infra-filesystem
 
+## 0.0.4.0 -- 2026-06-15
+
+* Added pms-infra-agent-server: TCP server listen/accept functionality for AI agents.
+
 ## 0.0.3.0 -- 2026-05-15
 
 * Add `pms-file-info` to report line count and byte size.
